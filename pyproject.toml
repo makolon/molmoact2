@@ -1,0 +1,15 @@
+[project]
+name = "molmoact2"
+version = "0.1.0"
+description = "Vendored MolmoAct2-DROID modeling code with initial_noise injection patch for DSRL."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = []
+
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools>=61.0", "wheel"]
+
+[tool.setuptools.packages.find]
+include = ["molmoact2*"]
