@@ -35,9 +35,9 @@ from polaris_hdf5 import (
     build_state_action,
 )
 
-# Repo root is examples/polaris/<file> -> ../../ ; the quantile-stats script
-# lives under src/lerobot/scripts/.
-_LEROBOT_ROOT = Path(__file__).resolve().parents[2]
+# examples/polaris/<file> is a sibling of lerobot/, not inside it; the
+# quantile-stats script lives under lerobot/src/lerobot/scripts/.
+_LEROBOT_ROOT = Path(__file__).resolve().parents[2] / "lerobot"
 
 _CAMERA_FEATURES: dict[str, str] = {
     "exterior_1": "observation.images.image",
