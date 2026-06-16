@@ -1016,6 +1016,57 @@ class MolmoAct2Policy(PreTrainedPolicy):
             )
         return ce_loss, z_loss
 
+    def _quiz_loss(
+        self,
+        batch: dict[str, Tensor],
+        model_inputs: dict[str, Tensor],
+        reduction: str = "mean",
+    ) -> Tensor:
+        """Auxiliary quiz CE (polaris, training-only). A separate prefix forward over
+        prompt + quiz-target tokens, decoded through the same LM head as the discrete action
+        loss. The action/inference path is untouched (this runs only when quiz_loss_weight>0
+        and the processor emitted quiz tensors). Mirrors openpi `Pi0._quiz_loss`."""
+        quiz_input_ids = batch.get("quiz_input_ids")
+        quiz_tokens = batch.get("quiz_tokens")
+        quiz_loss_mask = batch.get("quiz_loss_mask")
+        if quiz_input_ids is None or quiz_tokens is None or quiz_loss_mask is None:
+            raise RuntimeError("MolmoAct2 quiz loss requires quiz_input_ids/quiz_tokens/quiz_loss_mask.")
+        compute_dtype = _torch_dtype(self.config.model_dtype)
+        # Reuse the action pass's image features verbatim (same images); only the token stream
+        # (prompt + quiz block) differs. The processor asserts image-patch counts match.
+        quiz_inputs = {
+            "input_ids": quiz_input_ids,
+            "attention_mask": batch.get("quiz_attention_mask"),
+            "pixel_values": model_inputs.get("pixel_values"),
+            "image_token_pooling": model_inputs.get("image_token_pooling"),
+            "image_grids": model_inputs.get("image_grids"),
+            "image_num_crops": model_inputs.get("image_num_crops"),
+        }
+        quiz_inputs = {
+            key: (value.to(dtype=compute_dtype) if value.is_floating_point() else value)
+            for key, value in quiz_inputs.items()
+            if value is not None
+        }
+        outputs = self._backbone()(
+            **quiz_inputs,
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=False,
+        )
+        hidden_states = outputs.last_hidden_state
+        if hidden_states is None:
+            raise RuntimeError("MolmoAct2 backbone did not return last_hidden_state for the quiz pass.")
+        nq = int(quiz_tokens.shape[1])
+        # The quiz block is the trailing nq tokens; hidden state preceding each predicts it.
+        pred_hidden = hidden_states[:, -(nq + 1) : -1, :]
+        logits = F.linear(pred_hidden, self.model.lm_head.weight).float()
+        logp = F.log_softmax(logits, dim=-1)
+        targets = quiz_tokens.long().to(device=logp.device)
+        token_logp = logp.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+        mask = quiz_loss_mask.to(dtype=token_logp.dtype, device=token_logp.device)
+        per_example = -(token_logp * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1.0)
+        return per_example if reduction == "none" else per_example.mean()
+
     @staticmethod
     def _extract_discrete_token_bins(
         generated_ids: list[int],
@@ -1415,6 +1466,11 @@ class MolmoAct2Policy(PreTrainedPolicy):
                 metrics["discrete_z_loss"] = discrete_z_loss.detach().float().mean().item()
             losses.append(flow_loss)
             metrics["action_flow_loss"] = flow_loss.detach().float().mean().item()
+
+        if self.config.quiz_loss_weight > 0 and batch.get("quiz_tokens") is not None:
+            quiz_loss = self._quiz_loss(batch, model_inputs, reduction=reduction)
+            losses.append(self.config.quiz_loss_weight * quiz_loss)
+            metrics["quiz_loss"] = quiz_loss.detach().float().mean().item()
 
         loss = torch.stack(losses).sum(dim=0)
         metrics["loss"] = loss.detach().float().mean().item()

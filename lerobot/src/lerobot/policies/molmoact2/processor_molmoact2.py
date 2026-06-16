@@ -54,6 +54,7 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.import_utils import _scipy_available, _transformers_available, require_package
 
+from . import polaris_steering
 from .configuration_molmoact2 import MolmoAct2Config, infer_molmoact2_max_sequence_length
 
 if TYPE_CHECKING or _transformers_available:
@@ -365,6 +366,24 @@ def _as_text_list(value: Any, batch_size: int) -> list[str]:
     if len(texts) == 1:
         return texts * batch_size
     raise ValueError(f"Expected {batch_size} task strings, got {len(texts)}.")
+
+
+def _as_int_list(value: Any, batch_size: int) -> list[int]:
+    """Per-example ints (e.g. episode_index/frame_index) from a tensor/array/scalar batch."""
+    if value is None:
+        return [-1] * batch_size
+    if torch.is_tensor(value):
+        flat = value.detach().cpu().reshape(-1).tolist()
+    elif isinstance(value, np.ndarray):
+        flat = value.reshape(-1).tolist()
+    elif isinstance(value, (list, tuple)):
+        flat = list(value)
+    else:
+        flat = [value]
+    if len(flat) == 1 and batch_size > 1:
+        flat = flat * batch_size
+    out = [int(x) for x in flat[:batch_size]]
+    return out + [-1] * max(0, batch_size - len(out))
 
 
 def _tokenize_discrete_action(action: np.ndarray, processor: Any) -> list[int]:
@@ -679,6 +698,10 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
     chunk_size: int = 30
     max_action_dim: int = 32
     env_action_dim: int | None = None
+    steer_prob: float = 0.0
+    quiz_token_len: int = 64
+    steering_annotations_path: str | None = None
+    emit_quiz: bool = False
 
     def __post_init__(self) -> None:
         require_package("transformers", extra="molmoact2")
@@ -702,6 +725,17 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
         self._eos_token = self.processor.tokenizer.eos_token or ""
         self._eos_token_id = self.processor.tokenizer.eos_token_id
 
+        # Steerable / Quiz SFT (polaris). Segments drive both the prompt swap and the quiz
+        # target; quiz tensors are emitted whenever segments are loaded (the loss weight gate
+        # lives in the model, so the processor stays weight-agnostic). Training-only.
+        self._segments = (
+            polaris_steering.load_quiz_segments(self.steering_annotations_path)
+            if self.steering_annotations_path
+            else None
+        )
+        self._image_patch_id = _single_token_id(self.processor.tokenizer, "<im_patch>")
+        self._quiz_pad_token_id = self.processor.tokenizer.pad_token_id or 0
+
     def get_config(self) -> dict[str, Any]:
         return {
             "checkpoint_path": self.checkpoint_path,
@@ -721,6 +755,10 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
             "chunk_size": self.chunk_size,
             "max_action_dim": self.max_action_dim,
             "env_action_dim": self.env_action_dim,
+            "steer_prob": self.steer_prob,
+            "quiz_token_len": self.quiz_token_len,
+            "steering_annotations_path": self.steering_annotations_path,
+            "emit_quiz": self.emit_quiz,
         }
 
     def _resolve_max_sequence_length(
@@ -883,6 +921,24 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
         if task_source is None:
             task_source = complementary.get("language_instruction")
         tasks = _as_text_list(task_source, batch_size)
+
+        # Steerable / Quiz SFT (polaris): per-frame prompt swap. Training-only (gated on
+        # `action is not None`); covering segment is keyed on (episode_index, frame_index).
+        steered_flags = [False] * batch_size
+        quiz_hits: list[Any] = [None] * batch_size
+        if self._segments is not None and action is not None:
+            episode_ids = _as_int_list(complementary.get("episode_index"), batch_size)
+            frame_ids = _as_int_list(complementary.get("frame_index"), batch_size)
+            for i in range(batch_size):
+                seg = polaris_steering.covering_segment(self._segments.get(episode_ids[i]), frame_ids[i])
+                quiz_hits[i] = seg
+                if seg is None:
+                    continue
+                command = polaris_steering.sample_command(seg[2], self.steer_prob)
+                if command is not None:
+                    tasks[i] = command
+                    steered_flags[i] = True
+
         if self.normalize_language:
             tasks = [_normalize_question_text(task) for task in tasks]
         complementary["task"] = tasks
@@ -957,6 +1013,65 @@ class MolmoAct2PackInputsProcessorStep(ProcessorStep):
         complementary["action_dim_is_pad"] = action_dim_is_pad
         if action_horizon_is_pad is not None:
             complementary["action_horizon_is_pad"] = action_horizon_is_pad
+
+        # Quiz SFT (polaris): emit the metadata-prediction target. The quiz prefix = the SAME
+        # prompt (with image placeholders, no action answer) + a fixed-length quiz block. We
+        # strip prompt padding and LEFT-pad the (prompt + quiz block) so the quiz block is
+        # always the trailing `quiz_token_len` tokens regardless of the tokenizer's padding
+        # side — the model then reads `hidden[:, -(nq+1):-1]` and reuses the action pass's
+        # image features (image-patch counts must match).
+        if self.emit_quiz and self._segments is not None and action is not None:
+            quiz_ids, quiz_tmask, quiz_lmask = [], [], []
+            for i in range(batch_size):
+                seg = quiz_hits[i]
+                anchor = str(seg[3]) if seg is not None else ""
+                geometry = str(seg[4]) if seg is not None else ""
+                ids, tmask, lmask = polaris_steering.build_quiz_target_tokens(
+                    self.processor.tokenizer,
+                    anchor,
+                    geometry,
+                    steered=steered_flags[i],
+                    length=self.quiz_token_len,
+                    pad_token_id=self._quiz_pad_token_id,
+                )
+                quiz_ids.append(ids)
+                quiz_tmask.append(tmask)
+                quiz_lmask.append(lmask)
+            quiz_tokens = torch.tensor(quiz_ids, dtype=torch.long)
+            quiz_token_mask = torch.tensor(quiz_tmask, dtype=torch.bool)
+            quiz_loss_mask = torch.tensor(quiz_lmask, dtype=torch.bool)
+
+            prompt_inputs = self.processor(
+                text=prompt_texts, images=flat_images, return_tensors="pt", padding=True
+            )
+            n_patch_action = int((inputs["input_ids"] == self._image_patch_id).sum())
+            n_patch_quiz = int((prompt_inputs["input_ids"] == self._image_patch_id).sum())
+            if n_patch_action != n_patch_quiz:
+                raise ValueError(
+                    f"MolmoAct2 quiz prefix image-patch count {n_patch_quiz} != action "
+                    f"{n_patch_action}; cannot reuse image features."
+                )
+            p_ids = prompt_inputs["input_ids"]
+            p_attn = prompt_inputs["attention_mask"].bool()
+            seqs, attns = [], []
+            for i in range(batch_size):
+                real = p_ids[i][p_attn[i]].long()
+                seqs.append(torch.cat([real, quiz_tokens[i]]))
+                attns.append(
+                    torch.cat([torch.ones(real.numel(), dtype=torch.long), quiz_token_mask[i].long()])
+                )
+            max_len = max(int(s.numel()) for s in seqs)
+            quiz_input_ids = torch.full((batch_size, max_len), self._quiz_pad_token_id, dtype=torch.long)
+            quiz_attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long)
+            for i in range(batch_size):
+                n = int(seqs[i].numel())
+                quiz_input_ids[i, max_len - n :] = seqs[i]
+                quiz_attention_mask[i, max_len - n :] = attns[i]
+
+            complementary["quiz_input_ids"] = quiz_input_ids
+            complementary["quiz_attention_mask"] = quiz_attention_mask
+            complementary["quiz_tokens"] = quiz_tokens
+            complementary["quiz_loss_mask"] = quiz_loss_mask
 
         if action_padded is not None:
             transition[TransitionKey.ACTION] = action_padded
@@ -1055,6 +1170,10 @@ def make_molmoact2_pre_post_processors(
             chunk_size=chunk_size,
             max_action_dim=config.expected_max_action_dim,
             env_action_dim=env_action_dim,
+            steer_prob=config.steer_prob,
+            quiz_token_len=config.quiz_token_len,
+            steering_annotations_path=config.steering_annotations_path,
+            emit_quiz=config.quiz_loss_weight > 0,
         ),
         DeviceProcessorStep(device=config.device),
     ]

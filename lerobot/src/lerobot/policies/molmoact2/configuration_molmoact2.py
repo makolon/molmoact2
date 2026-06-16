@@ -245,6 +245,16 @@ class MolmoAct2Config(PreTrainedConfig):
     softmax_auxiliary_loss_scale: float = 1e-4
     discrete_loss_token_weighting: str = "root_subsegments_root_tokens"
 
+    # Steerable / Quiz SFT (polaris, docs/steerable_sft.md, docs/quiz_sft.md). All
+    # training-only and default-off so plain SFT is byte-identical. steer_prob>0 swaps
+    # the task prompt for a TAMP-derived steering command; quiz_loss_weight>0 adds the
+    # auxiliary metadata-prediction CE. steering_annotations_path resolves the JSON the
+    # samplers read (None disables both).
+    steer_prob: float = 0.0
+    quiz_loss_weight: float = 0.0
+    quiz_token_len: int = 64
+    steering_annotations_path: str | None = None
+
     optimizer_lr: float = 1e-5
     optimizer_vit_lr: float = 5e-6
     optimizer_connector_lr: float = 5e-6
@@ -332,6 +342,12 @@ class MolmoAct2Config(PreTrainedConfig):
             )
         if self.max_sequence_length is not None and self.max_sequence_length < 1:
             raise ValueError(f"max_sequence_length must be >= 1 or None, got {self.max_sequence_length}.")
+        if not 0.0 <= self.steer_prob <= 1.0:
+            raise ValueError(f"steer_prob must be in [0, 1], got {self.steer_prob}.")
+        if self.quiz_loss_weight < 0:
+            raise ValueError(f"quiz_loss_weight must be >= 0, got {self.quiz_loss_weight}.")
+        if self.quiz_token_len < 1:
+            raise ValueError(f"quiz_token_len must be >= 1, got {self.quiz_token_len}.")
 
     def inferred_max_sequence_length(
         self,
