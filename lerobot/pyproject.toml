@@ -112,6 +112,10 @@ dataset = [
     "torchcodec>=0.7.0,<0.12.0; sys_platform == 'win32'",
     "torchcodec>=0.11.0,<0.12.0; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64')",
     "jsonlines>=4.0.0,<5.0.0",
+    # examples/polaris HDF5->LeRobot converter reads TAMP h5 + MP4 streams via polaris_hdf5.
+    "h5py>=3.12,<4.0.0",
+    "imageio>=2.37,<3.0.0",
+    "imageio-ffmpeg>=0.6,<0.7",
 ]
 training = [
     "lerobot[dataset]",
